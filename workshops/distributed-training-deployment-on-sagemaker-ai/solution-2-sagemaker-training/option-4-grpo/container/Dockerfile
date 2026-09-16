@@ -35,10 +35,15 @@ LABEL com.amazonaws.grpo-verl-sagemaker.base-image="verlai/verl@${BASE_DIGEST}"
 # arriving in blocks, or being lost entirely if the job is killed.
 # PYTHONDONTWRITEBYTECODE avoids .pyc writes into a read-only-by-convention
 # /opt/ml/code. SAGEMAKER_PROGRAM names the entry point the sagemaker-training
-# toolkit executes from /opt/ml/code (Requirement 7 contract).
+# toolkit executes from /opt/ml/code (Requirement 7 contract). That is the Ray
+# launcher, which forms the cluster and then runs the script named by
+# `entry_script` on the head node. The notebook passes the same pair on the
+# command line (`python launcher.py --entrypoint entrypoint.py`); these defaults
+# cover a job started without SourceCode, straight from the image.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    SAGEMAKER_PROGRAM=entrypoint.py
+    SAGEMAKER_PROGRAM=launcher.py \
+    entry_script=entrypoint.py
 
 # Declare the contract layout the container writes to. SageMaker mounts over most
 # of these at runtime; creating them here means verify_stack.py can assert the

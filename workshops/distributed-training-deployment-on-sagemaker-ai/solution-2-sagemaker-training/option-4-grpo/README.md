@@ -103,11 +103,17 @@ option-4-grpo/
 │   ├── requirements-container.txt
 │   └── verify_stack.py       build-time check of the GPU stack
 └── scripts/                  runs inside the container
+    ├── launcher.py           forms the Ray cluster, then runs entrypoint.py on the head
     ├── entrypoint.py         reads hyperparameters.json, orchestrates the run
-    ├── start_ray.py          forms the Ray cluster
     ├── run_grpo.py           builds veRL overrides and invokes the trainer
     └── export_checkpoint.py  merges FSDP shards into a Hugging Face model
 ```
+
+`launcher.py` is the standard Ray launcher for SageMaker training jobs, copied unmodified from
+[aws-samples/sample-ray-on-amazon-sagemaker-training-jobs](https://github.com/aws-samples/sample-ray-on-amazon-sagemaker-training-jobs).
+It is the job's command (`python launcher.py --entrypoint entrypoint.py`): it starts the Ray head,
+joins any worker instances, and runs `entrypoint.py` on the head node with a connected Ray driver.
+Do not edit it here; changes belong upstream.
 
 `requirements.txt` is for the notebook kernel only. `container/requirements-container.txt`
 is the image's extension layer, installed with `--no-deps` against the veRL base image, and

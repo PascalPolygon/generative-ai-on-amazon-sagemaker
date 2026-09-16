@@ -35,6 +35,7 @@ Exit status is 0 when every check passes and 1 when any check fails, with all
 violations reported rather than just the first.
 """
 
+import importlib
 import os
 import re
 import shutil
@@ -72,6 +73,9 @@ has nowhere to write, and the failure would otherwise land mid-run.
 
 _ENTRY_POINT_SCRIPT = "train"
 """The console script ``sagemaker-training`` installs; SageMaker invokes it."""
+
+_LAUNCHER_IMPORTS = ("boto3", "ray", "requests", "sagemaker_training.environment", "yaml")
+"""Third-party modules ``scripts/launcher.py`` imports at module scope."""
 
 _LEADING_INTS = re.compile(r"^\D*?(\d+(?:\.\d+)*)")
 
@@ -268,6 +272,32 @@ def check_sagemaker_entry_point(code_dir: Path = CODE_DIR) -> tuple[str, ...]:
         violations.append(
             f"SAGEMAKER_PROGRAM={program!r} names a file that is absent from {code_dir}"
         )
+
+    # The Ray launcher hands off to the script named by `entry_script`, so that
+    # file has to be in the image too for a job started without SourceCode.
+    entry_script = os.environ.get("entry_script")
+    if not entry_script:
+        violations.append(
+            "entry_script is unset; launcher.py has no training script to run once "
+            "the Ray cluster is up"
+        )
+    elif not (code_dir / entry_script).is_file():
+        violations.append(
+            f"entry_script={entry_script!r} names a file that is absent from {code_dir}"
+        )
+
+    # launcher.py imports these at module scope. None is pinned in
+    # requirements-container.txt because each arrives with the base image (via
+    # ray[default], vLLM, and Hydra), so a base-image change that dropped one
+    # would only surface at job start.
+    for module in _LAUNCHER_IMPORTS:
+        try:
+            importlib.import_module(module)
+        except ImportError as exc:
+            violations.append(
+                f"{module!r} is not importable ({exc}); scripts/launcher.py imports it "
+                "at startup, so the training job would fail before Ray starts"
+            )
 
     return tuple(violations)
 

@@ -1,30 +1,36 @@
-"""SageMaker entry point for the GRPO training job.
+"""GRPO training entry script, run by ``launcher.py`` on the Ray head node.
 
-``SAGEMAKER_PROGRAM=entrypoint.py`` names this file, so the ``sagemaker-training``
-toolkit executes it once per training instance. It runs **only inside the GPU
-container**; per Requirement 1.7 it imports nothing from ``src/grpo_sagemaker/``,
-and its only imports beyond the standard library are the three sibling scripts in
-this directory.
+The training job's command is ``python launcher.py --entrypoint entrypoint.py``.
+``launcher.py`` is the standard Ray-on-SageMaker launcher from
+https://github.com/aws-samples/sample-ray-on-amazon-sagemaker-training-jobs, copied
+here unmodified. It owns everything about the Ray cluster: it starts the head,
+joins the workers, waits for the nodes to connect, keeps worker containers alive
+until the head finishes, and tears the cluster down. It then executes this file as
+``__main__`` on the head node only, in a process that already holds a connected
+Ray driver.
 
-It is deliberately thin. All it does is compose, in one fixed order:
+That leaves this script with only the GRPO-specific work, in one fixed order:
 
 1. Read the SageMaker contract -- ``resourceconfig.json``, ``hyperparameters.json``,
-   and the ``SM_CHANNEL_*`` mounts (Requirements 7.1, 7.2).
+   and the ``SM_CHANNEL_*`` mounts.
 2. Resolve each channel mount to the concrete data **files** inside it, and refuse
-   to continue if any declared channel holds zero rows -- before Ray is touched
-   (Requirement 7.6).
-3. Write the resolved configuration and a run record to ``/opt/ml/output/data``
-   (Requirement 7.5).
-4. Bootstrap Ray (``start_ray``), run the GRPO trainer (``run_grpo``), then merge
-   and validate the checkpoint into ``/opt/ml/model`` (``export_checkpoint``).
+   to continue if any declared channel holds zero rows.
+3. Write the resolved configuration and a run record to ``/opt/ml/output/data``.
+4. Confirm the Ray cluster the launcher formed registered every GPU the job was
+   given, run the GRPO trainer (``run_grpo``), then merge and validate the
+   checkpoint into ``/opt/ml/model`` (``export_checkpoint``).
+
+This script runs **only inside the GPU container**. Its only imports beyond the
+standard library are the two sibling scripts in this directory, and ``ray``, which
+is deferred into the one function that needs it so the pure helpers stay
+importable on a workstation.
 
 Two ordering decisions carry real weight.
 
-**Channels are validated before Ray starts, not after.** Requirement 7.6 says so,
-and the reason is money: Ray bootstrap on a multi-GPU instance takes a minute or
-more and veRL's own failure on an empty dataset surfaces deep inside a Ray actor.
-Checking the parquet footers first turns a confusing mid-run traceback into an
-immediate, named failure while the job has barely begun billing.
+**Channels are validated before anything expensive happens.** veRL's own failure
+on an empty dataset surfaces deep inside a Ray actor, minutes into a run. Checking
+the parquet footers first turns a confusing mid-run traceback into an immediate,
+named failure.
 
 **Channels resolve to files, never to the mount directory.** veRL's
 ``RLHFDataset`` dispatches on a file suffix and raises ``Unsupported file format``
@@ -33,34 +39,42 @@ for a directory -- it does not expand one. So ``SM_CHANNEL_TRAIN`` pointing at
 A channel holding several files becomes a Hydra list, which
 ``run_grpo.render_data_files`` accepts.
 
-The export step runs only after a successful trainer exit. A failed run leaves the
-checkpoints veRL synced to Amazon S3 untouched and ``/opt/ml/model`` empty, so
-SageMaker uploads no half-trained model and the merge can be retried against the
+The export step runs only after a successful trainer exit. A failed run raises,
+which ``launcher.py`` turns into a failure reason for SageMaker; the checkpoints
+veRL synced to Amazon S3 are left untouched and ``/opt/ml/model`` stays empty, so
+no half-trained model is uploaded and the merge can be retried against the
 retained checkpoint without repeating training.
 """
 
 import json
 import os
-import sys
 import time
 import traceback
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import export_checkpoint
 import run_grpo
-import start_ray
 
 CONFIG_DIR = Path("/opt/ml/input/config")
 HYPERPARAMETERS_PATH = CONFIG_DIR / "hyperparameters.json"
+RESOURCE_CONFIG_PATH = CONFIG_DIR / "resourceconfig.json"
 OUTPUT_DATA_DIR = Path("/opt/ml/output/data")
+FAILURE_REASON_PATH = Path("/opt/ml/output/failure")
+"""SageMaker surfaces this file's contents as the job's ``FailureReason``.
+
+``launcher.py`` reads it when the entry script fails and quotes it in the error it
+raises. It only writes the file itself when it is absent, and then only with a
+generic message, so the specific reason has to be written here first.
+"""
 RUN_RECORD_NAME = "run-record.json"
 RESOLVED_CONFIG_NAME = "resolved-hyperparameters.json"
 
 #: Declared channels, and the environment variable naming each mount. Both are
 #: required: a GRPO run without a validation split cannot report eval metrics, and
-#: the launcher always supplies both.
+#: the notebook always supplies both.
 CHANNEL_ENV_VARS: dict[str, str] = {
     run_grpo.TRAIN_CHANNEL: "SM_CHANNEL_TRAIN",
     run_grpo.VALIDATION_CHANNEL: "SM_CHANNEL_VALIDATION",
@@ -70,11 +84,11 @@ CHANNEL_ENV_VARS: dict[str, str] = {
 #: happens to hold more than one kind.
 DATA_SUFFIXES: tuple[str, ...] = (".parquet", ".jsonl", ".json")
 
-#: How long a non-head node waits for the head to finish, in the untested
-#: multi-node profile. Bounded so a lost head cannot hold instances forever;
-#: ``MaxRuntimeInSeconds`` on the job is the authoritative cap.
-WORKER_WAIT_TIMEOUT_S = 24 * 60 * 60
-WORKER_POLL_SECONDS = 30
+#: How long to wait for the cluster to register every expected GPU. The launcher
+#: has already waited for the nodes to connect, so this is normally satisfied on
+#: the first poll; the budget only bounds the failure case.
+GPU_REGISTRATION_TIMEOUT_S = 120
+GPU_REGISTRATION_POLL_S = 5.0
 
 
 class EntrypointError(RuntimeError):
@@ -85,6 +99,32 @@ class ChannelError(EntrypointError):
     """A declared data channel is missing, unreadable, or empty."""
 
 
+class ClusterError(EntrypointError):
+    """The Ray cluster is absent or smaller than the job's resources."""
+
+
+@dataclass(frozen=True)
+class ResourceConfig:
+    """The subset of the SageMaker resource contract this script needs.
+
+    ``current_host`` and ``hosts`` come from ``resourceconfig.json``;
+    ``gpus_per_node`` comes from ``SM_NUM_GPUS``.
+    """
+
+    current_host: str
+    hosts: tuple[str, ...]
+    gpus_per_node: int
+
+    @property
+    def node_count(self) -> int:
+        return len(self.hosts)
+
+    @property
+    def expected_gpu_count(self) -> int:
+        """GPUs the Ray cluster must hold before training may start."""
+        return self.node_count * self.gpus_per_node
+
+
 # --------------------------------------------------------------------------- #
 # Pure logic. No filesystem, no Ray, no subprocess.
 # --------------------------------------------------------------------------- #
@@ -92,9 +132,6 @@ class ChannelError(EntrypointError):
 
 def assert_channels_present(channel_rows: Mapping[str, int]) -> None:
     """Raise unless every declared channel holds at least one row.
-
-    Pure, so Property 12 can be checked over generated mappings with no
-    ``/opt/ml`` tree and no parquet files.
 
     Every channel is inspected before raising, and the error names **all** of the
     offenders rather than only the first. A job with two empty channels should
@@ -121,17 +158,14 @@ def assert_channels_present(channel_rows: Mapping[str, int]) -> None:
         detail = ", ".join(f"{name}={channel_rows[name]}" for name in empty)
         raise ChannelError(
             f"data channel(s) {empty} resolved to zero rows ({detail}). Training "
-            f"cannot proceed, and this is checked before Ray starts so the job "
-            f"fails now rather than inside a Ray actor. Re-run `grpo data prepare` "
+            f"cannot proceed, and this is checked up front so the job fails now "
+            f"rather than inside a Ray actor. Re-run the data preparation notebook "
             f"and confirm the manifest row counts are non-zero."
         )
 
 
 def select_data_files(channel: str, names: Sequence[str]) -> list[str]:
     """Pick the data files from one channel's directory listing.
-
-    Pure function over a listing, so the selection rule is testable without a
-    filesystem.
 
     Only the first matching suffix group is returned. Mixing ``.parquet`` and
     ``.json`` in one channel would make veRL read the same split through two
@@ -173,9 +207,83 @@ def render_channel_value(paths: Sequence[str]) -> str:
     return "[" + ",".join(paths) + "]"
 
 
+def parse_resource_config(payload: Mapping[str, object], gpus_per_node: int) -> ResourceConfig:
+    """Build a :class:`ResourceConfig` from parsed ``resourceconfig.json``.
+
+    Kept separate from the file read so the parsing rules are testable without a
+    ``/opt/ml`` tree.
+    """
+    current_host = payload.get("current_host")
+    hosts = payload.get("hosts")
+
+    if not isinstance(current_host, str) or not current_host:
+        raise EntrypointError(
+            f"resourceconfig.json has no usable 'current_host'; got {current_host!r}"
+        )
+    if not isinstance(hosts, Sequence) or isinstance(hosts, str) or not hosts:
+        raise EntrypointError(f"resourceconfig.json has no usable 'hosts' list; got {hosts!r}")
+    if not all(isinstance(host, str) and host for host in hosts):
+        raise EntrypointError(
+            f"resourceconfig.json 'hosts' must be non-empty strings; got {list(hosts)!r}"
+        )
+    if current_host not in hosts:
+        raise EntrypointError(
+            f"current_host {current_host!r} is absent from hosts {list(hosts)!r}; the "
+            f"resource config and the environment disagree"
+        )
+    if gpus_per_node < 1:
+        raise EntrypointError(
+            f"SM_NUM_GPUS must be at least 1 for a GRPO run; got {gpus_per_node}"
+        )
+
+    return ResourceConfig(
+        current_host=current_host,
+        hosts=tuple(hosts),
+        gpus_per_node=gpus_per_node,
+    )
+
+
+def render_registration_state(nodes: Sequence[Mapping[str, object]]) -> str:
+    """Render one line per Ray node: address, liveness, and registered GPUs.
+
+    Takes the shape ``ray.nodes()`` returns but requires only plain mappings, so
+    the failure report is verifiable without a live cluster.
+    """
+    if not nodes:
+        return "  (no nodes registered)"
+
+    lines = []
+    for node in nodes:
+        address = node.get("NodeManagerAddress") or node.get("NodeID") or "<unknown>"
+        hostname = node.get("NodeName") or "<unknown>"
+        alive = bool(node.get("Alive", False))
+        resources = node.get("Resources") or {}
+        gpus = 0.0
+        if isinstance(resources, Mapping):
+            gpus = float(resources.get("GPU", 0.0) or 0.0)
+        lines.append(f"  - {hostname} ({address}): alive={alive} gpus={gpus:g}")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # SageMaker contract reads.
 # --------------------------------------------------------------------------- #
+
+
+def _read_json_object(path: Path, what: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise EntrypointError(
+            f"{what} not found at {path}; this script runs only inside a SageMaker "
+            f"training container"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise EntrypointError(f"{path} is not valid JSON: {exc}") from exc
+
+    if not isinstance(payload, Mapping):
+        raise EntrypointError(f"{path} must contain a JSON object; got {type(payload).__name__}")
+    return payload
 
 
 def read_hyperparameters(path: Path = HYPERPARAMETERS_PATH) -> dict[str, str]:
@@ -186,35 +294,25 @@ def read_hyperparameters(path: Path = HYPERPARAMETERS_PATH) -> dict[str, str]:
     ``str`` here rather than trusted, so a hand-edited file carrying a real JSON
     number still yields the string form the override renderers expect.
     """
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise EntrypointError(
-            f"hyperparameters not found at {path}; this script runs only inside a "
-            f"SageMaker training container"
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise EntrypointError(f"{path} is not valid JSON: {exc}") from exc
-
-    if not isinstance(payload, Mapping):
-        raise EntrypointError(
-            f"{path} must contain a JSON object; got {type(payload).__name__}"
-        )
+    payload = _read_json_object(path, "hyperparameters")
     return {str(key): str(value) for key, value in payload.items()}
 
 
 def read_resource_config(
-    path: Path = start_ray.RESOURCE_CONFIG_PATH,
+    path: Path = RESOURCE_CONFIG_PATH,
     env: Mapping[str, str] | None = None,
-) -> start_ray.ResourceConfig:
-    """Read the SageMaker resource configuration.
+) -> ResourceConfig:
+    """Read ``resourceconfig.json`` and ``SM_NUM_GPUS`` into a config object."""
+    env = os.environ if env is None else env
+    payload = _read_json_object(path, "SageMaker resource configuration")
 
-    Delegates to ``start_ray.read_resource_config``, which owns
-    :class:`start_ray.ResourceConfig` because ``start_ray.bootstrap`` consumes it.
-    Re-exported here because the design lists this function on the entrypoint and
-    a caller should not have to know which sibling defines the type.
-    """
-    return start_ray.read_resource_config(path, env)
+    raw_gpus = env.get("SM_NUM_GPUS", "0")
+    try:
+        gpus_per_node = int(raw_gpus)
+    except (TypeError, ValueError) as exc:
+        raise EntrypointError(f"SM_NUM_GPUS is not an integer: {raw_gpus!r}") from exc
+
+    return parse_resource_config(payload, gpus_per_node)
 
 
 def count_rows(path: Path) -> int:
@@ -308,6 +406,75 @@ def resolve_channel_files(
 
 
 # --------------------------------------------------------------------------- #
+# Ray cluster check.
+# --------------------------------------------------------------------------- #
+
+
+def assert_cluster_gpus(
+    expected_gpus: int,
+    *,
+    timeout_s: int = GPU_REGISTRATION_TIMEOUT_S,
+    poll_seconds: float = GPU_REGISTRATION_POLL_S,
+) -> int:
+    """Confirm the Ray cluster holds ``expected_gpus``, and return the registered count.
+
+    ``launcher.py`` connects a Ray driver in this process before running this
+    script, and waits for every node to join -- but on a timeout it logs a warning
+    and proceeds with a partial cluster. veRL would then block forever waiting
+    for a resource pool it can never fill. Checking the GPU count here turns that
+    hang into an immediate failure that names the missing nodes.
+
+    If no driver is connected (this script was run without the launcher), a
+    connection to a running cluster is attempted, and a clear error raised when
+    there is none.
+    """
+    try:
+        import ray
+    except ImportError as exc:  # pragma: no cover - present in the container
+        raise ClusterError(
+            "the 'ray' package is not importable; entrypoint.py runs only inside the "
+            "veRL GPU container, which ships Ray"
+        ) from exc
+
+    if not ray.is_initialized():
+        try:
+            ray.init(address="auto", ignore_reinit_error=True)
+        except Exception as exc:  # noqa: BLE001 - any failure here means no cluster
+            raise ClusterError(
+                "no Ray cluster is running. Start the job through the launcher: "
+                "`python launcher.py --entrypoint entrypoint.py`, which forms the "
+                f"cluster before running this script. Ray reported: {exc}"
+            ) from exc
+
+    deadline = time.monotonic() + timeout_s
+    registered = 0
+    while True:
+        registered = int(ray.cluster_resources().get("GPU", 0))
+        if registered >= expected_gpus:
+            print(
+                f"[entrypoint] Ray cluster has {registered} GPU(s); expected {expected_gpus}",
+                flush=True,
+            )
+            return registered
+        if time.monotonic() >= deadline:
+            break
+        print(
+            f"[entrypoint] waiting for GPUs: {registered}/{expected_gpus} registered",
+            flush=True,
+        )
+        time.sleep(poll_seconds)
+
+    raise ClusterError(
+        f"Ray registered {registered} of {expected_gpus} expected GPU(s) within "
+        f"{timeout_s}s. Per-node registration state:\n"
+        f"{render_registration_state(ray.nodes())}\n"
+        f"If nodes are missing, check the launcher's log for 'Timed out waiting for "
+        f"all nodes to connect' and that the job's security group permits ingress "
+        f"from itself on port 6379."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Run record.
 # --------------------------------------------------------------------------- #
 
@@ -334,47 +501,20 @@ def output_data_dir(env: Mapping[str, str] | None = None) -> Path:
     return Path(env.get("SM_OUTPUT_DATA_DIR") or OUTPUT_DATA_DIR)
 
 
-# --------------------------------------------------------------------------- #
-# Multi-node worker wait (untested profile).
-# --------------------------------------------------------------------------- #
+def write_failure_reason(message: str, path: Path = FAILURE_REASON_PATH) -> None:
+    """Record ``message`` as the job's failure reason, unless one is already there.
 
-
-def await_head_completion(
-    timeout_s: int = WORKER_WAIT_TIMEOUT_S,
-    poll_seconds: int = WORKER_POLL_SECONDS,
-) -> int:
-    """Block a non-head node while the head drives training.
-
-    Part of the explicitly untested multi-node profile. A worker container that
-    exited as soon as it had joined Ray would be torn down by SageMaker, taking
-    its GPUs out of the cluster mid-run, so the worker has to stay alive until the
-    head is finished.
-
-    Returns 0 when the head is gone, and raises on timeout so a lost head does not
-    hold instances for the whole job runtime.
+    First writer wins, matching the launcher's own rule, so an earlier and more
+    specific reason is never overwritten by a later, more generic one. Never
+    raises: the traceback is already on its way to CloudWatch.
     """
     try:
-        import ray
-    except ImportError as exc:  # pragma: no cover - present in the container
-        raise EntrypointError("ray is not importable inside the container") from exc
-
-    print("[entrypoint] worker node: waiting for the head to finish", flush=True)
-    deadline = time.monotonic() + timeout_s
-    ray.init(address="auto", ignore_reinit_error=True)
-    try:
-        while time.monotonic() < deadline:
-            alive = [node for node in ray.nodes() if node.get("Alive")]
-            if len(alive) <= 1:
-                print("[entrypoint] worker node: cluster wound down, exiting", flush=True)
-                return 0
-            time.sleep(poll_seconds)
-    finally:
-        ray.shutdown()
-
-    raise EntrypointError(
-        f"worker node waited {timeout_s}s and the Ray head never wound the cluster "
-        f"down; failing so the instance is released"
-    )
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(message, encoding="utf-8")
+    except OSError as exc:
+        print(f"[entrypoint] could not write {path}: {exc}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -382,13 +522,15 @@ def await_head_completion(
 # --------------------------------------------------------------------------- #
 
 
-def main() -> int:
-    """Run the training job. Returns the process exit code.
+def main() -> None:
+    """Run the training job on the Ray head node.
 
     Order is fixed and load-bearing: read the contract, validate the channels,
-    record what was resolved, bootstrap Ray, train, export. A non-zero trainer
-    exit short-circuits the export, so ``/opt/ml/model`` stays empty and SageMaker
-    uploads nothing.
+    record what was resolved, confirm the cluster, train, export. Every failure
+    raises. ``launcher.py`` executes this module as ``__main__`` inside its own
+    try/except, so an exception is how it learns the job failed: it records the
+    reason in ``/opt/ml/output/failure``, tears Ray down, and exits non-zero. A
+    ``sys.exit`` here would bypass that path.
     """
     started = datetime.now(timezone.utc)
     out_dir = output_data_dir()
@@ -412,30 +554,19 @@ def main() -> int:
         )
         write_json(out_dir, RESOLVED_CONFIG_NAME, hyperparameters)
 
-        # Requirement 7.6: channels are validated before Ray is touched.
+        # Channels are validated before the trainer is touched.
         record["stage"] = "resolving-channels"
         channel_values, channel_rows, channel_files = resolve_channel_files()
         assert_channels_present(channel_rows)
         record.update({"channel_files": channel_files, "channel_rows": channel_rows})
 
-        record["stage"] = "ray-bootstrap"
+        record["stage"] = "cluster-check"
         write_json(out_dir, RUN_RECORD_NAME, record)
-        cluster = start_ray.bootstrap(resource_cfg)
+        gpu_count = assert_cluster_gpus(resource_cfg.expected_gpu_count)
         record["ray"] = {
-            "head_host": cluster.head_host,
-            "is_head": cluster.is_head,
-            "address": cluster.address,
-            "gpu_count": cluster.gpu_count,
-            "expected_gpu_count": cluster.expected_gpu_count,
+            "gpu_count": gpu_count,
+            "expected_gpu_count": resource_cfg.expected_gpu_count,
         }
-
-        # Only the head drives the trainer; veRL fans work out over Ray from there.
-        if not cluster.is_head:
-            record["stage"] = "worker-wait"
-            write_json(out_dir, RUN_RECORD_NAME, record)
-            code = await_head_completion()
-            record.update({"stage": "worker-complete", "exit_code": code})
-            return code
 
         record["stage"] = "training"
         argv = run_grpo.build_verl_argv(
@@ -451,13 +582,11 @@ def main() -> int:
 
         if exit_code != 0:
             record["stage"] = "training-failed"
-            print(
-                f"[entrypoint] trainer exited {exit_code}; skipping export so no "
-                f"partial model is uploaded. Checkpoints synced to Amazon S3 are "
-                f"retained and the merge can be retried.",
-                flush=True,
+            raise EntrypointError(
+                f"trainer exited {exit_code}; skipping export so no partial model is "
+                f"uploaded. Checkpoints synced to Amazon S3 are retained and the merge "
+                f"can be retried."
             )
-            return exit_code
 
         record["stage"] = "export"
         write_json(out_dir, RUN_RECORD_NAME, record)
@@ -469,14 +598,16 @@ def main() -> int:
             "files": list(result.files),
         }
         record["stage"] = "complete"
-        return 0
 
     except Exception as exc:  # noqa: BLE001 - the record must capture every failure
         record["stage"] = f"failed:{record.get('stage', 'unknown')}"
         record["error"] = f"{type(exc).__name__}: {exc}"
         record["traceback"] = traceback.format_exc()
-        # Re-raised below so SageMaker sees a non-zero exit and the traceback lands
-        # in CloudWatch, where an operator will actually read it.
+        # The launcher's cleanup swallows this exception on its way out and
+        # reports whatever /opt/ml/output/failure holds, so the specific reason
+        # is written there first. Re-raised so the launcher marks the job failed
+        # and the traceback lands in CloudWatch, where an operator will read it.
+        write_failure_reason(f"{record['stage']}: {record['error']}")
         raise
     finally:
         record["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -487,4 +618,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

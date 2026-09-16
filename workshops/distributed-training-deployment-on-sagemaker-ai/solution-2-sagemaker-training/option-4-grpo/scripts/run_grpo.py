@@ -241,7 +241,7 @@ HP_OVERRIDES: tuple[OverrideSpec, ...] = (
     # the KL term to apply at all.
     OverrideSpec("actor_rollout_ref.actor.use_kl_loss", "use_kl_loss", "bool"),
     OverrideSpec("actor_rollout_ref.actor.kl_loss_coef", "kl_loss_coef", "float"),
-    # Node count, which must agree with the Ray cluster start_ray.py formed.
+    # Node count, which must agree with the Ray cluster launcher.py formed.
     OverrideSpec("trainer.nnodes", "instance_count", "int", minimum=1),
     # --- Actor model and sequence budget ---
     OverrideSpec("actor_rollout_ref.model.path", "actor_path", "str"),
@@ -460,8 +460,8 @@ def resolve_gpus_per_node(
     """Return the GPU count per node, from the argument or from ``SM_NUM_GPUS``.
 
     Taking the value as an argument is what keeps :func:`build_verl_argv` pure:
-    ``entrypoint.py`` already holds this number on the ``ResourceConfig`` that
-    ``start_ray.read_resource_config`` produced, and a test can pass it directly.
+    ``entrypoint.py`` already holds this number on the ``ResourceConfig`` it read
+    from ``resourceconfig.json``, and a test can pass it directly.
     Reading the environment is the fallback for a direct call.
     """
     if gpus_per_node is not None:
